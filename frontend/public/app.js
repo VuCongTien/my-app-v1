@@ -5,6 +5,7 @@ let pollTimer = null;
 let totalRequests = 0;
 let podHitMap = {};
 let azHitMap = {};
+let hpaMonitorRunId = 0;
 
 // DOM Elements
 const pollingBadge = document.getElementById('pollingBadge');
@@ -29,6 +30,10 @@ const startStressBtn = document.getElementById('startStressBtn');
 const stressStatusContainer = document.getElementById('stressStatusContainer');
 const stressProgressBar = document.getElementById('stressProgressBar');
 const stressStatusText = document.getElementById('stressStatusText');
+const hpaCurrentReplicas = document.getElementById('hpaCurrentReplicas');
+const hpaReadyReplicas = document.getElementById('hpaReadyReplicas');
+const hpaDesiredReplicas = document.getElementById('hpaDesiredReplicas');
+const hpaReplicaMessage = document.getElementById('hpaReplicaMessage');
 
 const dbStatusBadge = document.getElementById('dbStatusBadge');
 const dbHostText = document.getElementById('dbHostText');
@@ -36,6 +41,7 @@ const dbUserText = document.getElementById('dbUserText');
 const dbTotalVisits = document.getElementById('dbTotalVisits');
 const logVisitBtn = document.getElementById('logVisitBtn');
 const recentVisitsList = document.getElementById('recentVisitsList');
+const dbActionStatus = document.getElementById('dbActionStatus');
 
 const secSecretsSource = document.getElementById('secSecretsSource');
 const secAppConfigStatus = document.getElementById('secAppConfigStatus');
@@ -61,6 +67,8 @@ async function initApp() {
   // Initial Fetch & Start Polling
   fetchInfoData();
   fetchDbVisitsData();
+  refreshHpaStatus();
+  setInterval(refreshHpaStatus, 5000);
   startPolling();
 }
 
@@ -226,6 +234,7 @@ function renderDistributionUI() {
 // Trigger CPU Load Test on Backend (HPA Test)
 async function triggerCpuStress() {
   const seconds = parseInt(stressDuration.value, 10);
+  const baseline = await refreshHpaStatus();
   startStressBtn.disabled = true;
   stressStatusContainer.classList.remove('hidden');
   stressProgressBar.style.width = '0%';
@@ -241,15 +250,18 @@ async function triggerCpuStress() {
   try {
     const res = await fetch(`/api/proxy/stress?seconds=${seconds}`);
     const data = await res.json();
+    if (!res.ok) throw new Error(data.message || data.error || `Backend returned ${res.status}`);
     
     clearInterval(progressInterval);
     stressProgressBar.style.width = '100%';
     stressStatusText.textContent = `✅ Completed! Pod ${data.podName} ran ${data.iterationsCompleted} CPU calculations.`;
     
-    // Trigger rapid refresh to catch newly scaled pods
+    stressStatusText.textContent = `CPU load completed on ${data.podName || 'a backend pod'}. Checking HPA replica count...`;
+    // Refresh topology and watch actual Deployment replica status.
     fetchInfoData();
     setTimeout(fetchInfoData, 3000);
     setTimeout(fetchInfoData, 6000);
+    monitorHpaScale(baseline?.currentReplicas ?? null);
   } catch (err) {
     clearInterval(progressInterval);
     stressStatusText.textContent = `❌ Stress test error: ${err.message}`;
@@ -260,11 +272,69 @@ async function triggerCpuStress() {
   }
 }
 
+// Read authoritative replica counts from the backend's Kubernetes API endpoint.
+async function refreshHpaStatus() {
+  try {
+    const res = await fetch('/api/proxy/hpa/status');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `Backend returned ${res.status}`);
+
+    hpaCurrentReplicas.textContent = data.currentReplicas ?? 0;
+    hpaReadyReplicas.textContent = data.readyReplicas ?? 0;
+    hpaDesiredReplicas.textContent = data.desiredReplicas ?? 0;
+    if (!hpaMonitorRunId) hpaReplicaMessage.textContent = `Deployment: ${data.deployment}`;
+    return data;
+  } catch (err) {
+    hpaCurrentReplicas.textContent = '--';
+    hpaReadyReplicas.textContent = '--';
+    hpaDesiredReplicas.textContent = '--';
+    hpaReplicaMessage.textContent = 'Replica status unavailable. Check backend service account access and Kubernetes metrics.';
+    return null;
+  }
+}
+
+// HPA metrics and scale-up take time, so watch the Deployment after load completes.
+async function monitorHpaScale(startingReplicas) {
+  const runId = ++hpaMonitorRunId;
+  if (startingReplicas === null) {
+    hpaReplicaMessage.textContent = 'CPU load completed. Waiting for replica status...';
+  }
+
+  for (let attempt = 0; attempt < 18; attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    if (runId !== hpaMonitorRunId) return;
+
+    const status = await refreshHpaStatus();
+    if (!status) continue;
+    if (startingReplicas !== null && status.currentReplicas > startingReplicas) {
+      hpaReplicaMessage.textContent = `HPA scaled backend replicas from ${startingReplicas} to ${status.currentReplicas}.`;
+      stressStatusText.textContent = `HPA scale-up confirmed: ${startingReplicas} → ${status.currentReplicas} replicas.`;
+      return;
+    }
+    if (startingReplicas === null) startingReplicas = status.currentReplicas;
+    hpaReplicaMessage.textContent = `Load finished. HPA check ${attempt + 1}/18: ${status.currentReplicas} current, ${status.desiredReplicas} desired.`;
+  }
+
+  if (runId === hpaMonitorRunId) {
+    const current = hpaCurrentReplicas.textContent;
+    hpaReplicaMessage.textContent = `No replica increase observed yet (${current} current). Check HPA metrics and CPU requests, then try a longer load.`;
+    stressStatusText.textContent = 'CPU load completed; no HPA scale-up was observed during the monitoring window.';
+  }
+}
+
 // Fetch RDS PostgreSQL Visits Data
 async function fetchDbVisitsData() {
   try {
     const res = await fetch('/api/proxy/db/visits');
     const data = await res.json();
+
+    if (!res.ok || data.dbStatus === 'Error') {
+      dbStatusBadge.textContent = 'DATABASE ERROR';
+      dbStatusBadge.className = 'tag tag-danger';
+      dbActionStatus.textContent = data.error || 'PostgreSQL read failed.';
+      dbActionStatus.className = 'db-action-status error';
+      return null;
+    }
 
     if (data.dbStatus && data.dbStatus.includes('Connected')) {
       dbStatusBadge.textContent = 'PostgreSQL CONNECTED';
@@ -274,7 +344,8 @@ async function fetchDbVisitsData() {
       dbStatusBadge.className = 'tag tag-warn';
     }
 
-    dbTotalVisits.textContent = data.totalVisits || 0;
+    const totalVisits = Number(data.totalVisits ?? 0);
+    dbTotalVisits.textContent = totalVisits;
 
     if (data.recentVisits && data.recentVisits.length > 0) {
       let listHtml = '';
@@ -291,22 +362,36 @@ async function fetchDbVisitsData() {
     } else {
       recentVisitsList.innerHTML = '<li class="empty-state">No database records found.</li>';
     }
+    return totalVisits;
   } catch (err) {
     dbStatusBadge.textContent = 'DB OFFLINE';
     dbStatusBadge.className = 'tag tag-danger';
+    dbActionStatus.textContent = 'Could not read PostgreSQL visit records.';
+    dbActionStatus.className = 'db-action-status error';
+    return null;
   }
 }
 
 // Log a Visit into RDS Database
 async function logDatabaseVisit() {
   logVisitBtn.disabled = true;
+  dbActionStatus.textContent = 'Writing visit to PostgreSQL...';
+  dbActionStatus.className = 'db-action-status';
+  const previousTotal = Number(dbTotalVisits.textContent) || 0;
   try {
     const res = await fetch('/api/proxy/db/visit', { method: 'POST' });
     const data = await res.json();
-    console.log('[DB Visit] Result:', data);
-    fetchDbVisitsData();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || data.message || `Backend returned ${res.status}`);
+    }
+
+    const totalVisits = await fetchDbVisitsData();
+    if (totalVisits === null) throw new Error('Visit was inserted, but the updated total could not be read.');
+    dbActionStatus.textContent = `Visit inserted. Total logged visits: ${previousTotal} → ${totalVisits}.`;
+    dbActionStatus.className = 'db-action-status success';
   } catch (err) {
-    console.error('[DB Visit] Error:', err);
+    dbActionStatus.textContent = `Visit was not confirmed in PostgreSQL: ${err.message}`;
+    dbActionStatus.className = 'db-action-status error';
   } finally {
     logVisitBtn.disabled = false;
   }

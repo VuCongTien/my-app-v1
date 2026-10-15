@@ -132,6 +132,12 @@
           </div>
           <div id="stressStatusText" class="stress-text font-mono">Initializing stress test...</div>
         </div>
+        <div class="hpa-replica-summary" aria-live="polite">
+          <div class="replica-metric"><span>Current replicas</span><strong id="hpaCurrentReplicas">--</strong></div>
+          <div class="replica-metric"><span>Ready replicas</span><strong id="hpaReadyReplicas">--</strong></div>
+          <div class="replica-metric"><span>Desired replicas</span><strong id="hpaDesiredReplicas">--</strong></div>
+        </div>
+        <p id="hpaReplicaMessage" class="hpa-replica-message" role="status" aria-live="polite">Reading backend replica status...</p>
       </section>
 
       <!-- Card 4: RDS PostgreSQL Database Integration -->
@@ -163,6 +169,7 @@
           <button id="logVisitBtn" class="btn btn-secondary btn-block">
             <span>📝 Record Visit to Database</span>
           </button>
+          <p id="dbActionStatus" class="db-action-status" role="status" aria-live="polite"></p>
         </div>
 
         <div class="recent-visits-box">

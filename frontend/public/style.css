@@ -370,6 +370,41 @@ body {
   color: var(--accent-orange);
 }
 
+.hpa-replica-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.replica-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border-card);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.replica-metric strong {
+  color: var(--accent-cyan);
+  font: 600 1.15rem var(--font-code);
+}
+
+.hpa-replica-message,
+.db-action-status {
+  min-height: 1.3rem;
+  margin-top: 0.5rem;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.db-action-status.success { color: var(--accent-emerald); }
+.db-action-status.error { color: var(--accent-red); }
+
 /* Database Box */
 .db-info-box {
   background: rgba(0, 0, 0, 0.2);

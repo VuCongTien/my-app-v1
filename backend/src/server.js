@@ -1,8 +1,10 @@
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const { AppConfigDataClient, StartConfigurationSessionCommand, GetLatestConfigurationCommand } = require('@aws-sdk/client-appconfigdata');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const https = require('node:https');
 
 require('dotenv').config();
 
@@ -19,57 +21,62 @@ const podNamespace = process.env.POD_NAMESPACE || 'production';
 const nodeAZ = process.env.NODE_AZ || process.env.AWS_AVAILABILITY_ZONE || 'ap-southeast-1a';
 const awsRegion = process.env.AWS_REGION || 'ap-southeast-1';
 
-// Cache for AWS Secrets & AppConfig
+// Cache for database secrets & AppConfig
 let dbSecretsCache = null;
 let appConfigCache = { message: 'Default internal app config', version: '1.0.0' };
 let dbPool = null;
 
-// Initialize AWS Clients (Uses IRSA - IAM Roles for Service Accounts)
-const secretsClient = new SecretsManagerClient({ region: awsRegion });
+// Initialize AWS AppConfig client (Uses IRSA - IAM Roles for Service Accounts)
 const appConfigClient = new AppConfigDataClient({ region: awsRegion });
 
 /**
- * Fetch Secrets from AWS Secrets Manager using IRSA
+ * Read database credentials from the Secrets Store CSI mounted JSON file.
+ * Environment variables remain available for local development and provide
+ * non-secret connection settings such as the RDS hostname and database name.
  */
 async function getDatabaseSecrets() {
-  const secretName = process.env.SECRET_NAME || 'prod/rds/postgres';
-
-  // Fallback to explicit env vars if provided directly
-  if (process.env.DB_HOST && process.env.DB_PASSWORD) {
-    return {
-      host: process.env.DB_HOST,
-      port: parseInt(process.env.DB_PORT || '5432', 10),
-      username: process.env.DB_USER || 'postgres',
-      password: process.env.DB_PASSWORD,
-      dbname: process.env.DB_NAME || 'appdb',
-      source: 'Environment Variables'
-    };
-  }
-
   if (dbSecretsCache) {
     return dbSecretsCache;
   }
 
+  const secretName = process.env.SECRET_NAME;
+  let secret = {};
+  let source = 'Environment Variables';
+
   try {
-    const command = new GetSecretValueCommand({ SecretId: secretName });
-    const response = await secretsClient.send(command);
-    if (response.SecretString) {
-      const secret = JSON.parse(response.SecretString);
-      dbSecretsCache = {
-        host: secret.host || secret.hostname,
-        port: parseInt(secret.port || '5432', 10),
-        username: secret.username || secret.user,
-        password: secret.password,
-        dbname: secret.dbname || secret.database || 'appdb',
-        source: `AWS Secrets Manager (${secretName})`
-      };
-      return dbSecretsCache;
+    if (secretName) {
+      const secretPath = path.join('/mnt/secrets-store', secretName);
+      const secretJson = await fs.readFile(secretPath, 'utf8');
+      const parsedSecret = JSON.parse(secretJson);
+      if (!parsedSecret || typeof parsedSecret !== 'object' || Array.isArray(parsedSecret)) {
+        throw new Error('Mounted database secret must contain a JSON object.');
+      }
+      secret = parsedSecret;
+      source = 'Secrets Store CSI Driver';
     }
   } catch (error) {
-    console.warn(`[SecretsManager] Could not fetch secret '${secretName}':`, error.message);
+    if (error.code !== 'ENOENT') {
+      console.warn('[Database] Could not read or parse the mounted database secret.');
+    }
+  }
+
+  const secrets = {
+    host: secret.host || secret.hostname || process.env.DB_HOST,
+    port: parseInt(secret.port || process.env.DB_PORT || '5432', 10),
+    username: secret.username || secret.user || process.env.DB_USER,
+    password: secret.password || process.env.DB_PASSWORD,
+    dbname: secret.dbname || secret.database || process.env.DB_NAME,
+    source
+  };
+
+  const missing = ['host', 'username', 'password', 'dbname'].filter((key) => !secrets[key]);
+  if (missing.length) {
+    console.warn(`[Database] Database configuration is incomplete (missing: ${missing.join(', ')}).`);
     return null;
   }
-  return null;
+
+  dbSecretsCache = secrets;
+  return dbSecretsCache;
 }
 
 /**
@@ -79,13 +86,15 @@ async function initDbPool() {
   if (dbPool) return dbPool;
 
   const secrets = await getDatabaseSecrets();
-  if (!secrets || !secrets.host) {
-    console.log('[Database] Secrets not available or DB host omitted. Database features will run in mock mode.');
+  if (!secrets) {
+    console.log('[Database] Credentials or connection settings are unavailable. Database features will run in mock mode.');
     return null;
   }
 
+  let pool;
+  let client;
   try {
-    dbPool = new Pool({
+    pool = new Pool({
       host: secrets.host,
       port: secrets.port,
       user: secrets.username,
@@ -96,7 +105,7 @@ async function initDbPool() {
     });
 
     // Auto-create visits table if connected
-    const client = await dbPool.connect();
+    client = await pool.connect();
     await client.query(`
       CREATE TABLE IF NOT EXISTS page_visits (
         id SERIAL PRIMARY KEY,
@@ -106,13 +115,68 @@ async function initDbPool() {
       );
     `);
     client.release();
+    client = null;
+    dbPool = pool;
     console.log('[Database] Successfully connected to PostgreSQL and ensured schema!');
     return dbPool;
   } catch (error) {
-    console.error('[Database] Connection failed:', error.message);
+    console.error(`[Database] PostgreSQL connection or schema initialization failed (code: ${error.code || 'unknown'}).`);
+    if (client) client.release();
+    if (pool) await pool.end().catch(() => {});
     dbPool = null;
-    return null;
+    throw error;
   }
+}
+
+/**
+ * Read this deployment's replica status through the in-cluster Kubernetes API.
+ */
+async function getDeploymentStatus() {
+  const deploymentName = process.env.DEPLOYMENT_NAME;
+  if (!deploymentName || !podNamespace) {
+    throw new Error('Deployment identity is not configured.');
+  }
+
+  const serviceAccountPath = '/var/run/secrets/kubernetes.io/serviceaccount';
+  const [token, ca] = await Promise.all([
+    fs.readFile(path.join(serviceAccountPath, 'token'), 'utf8'),
+    fs.readFile(path.join(serviceAccountPath, 'ca.crt'))
+  ]);
+  const apiPath = `/apis/apps/v1/namespaces/${encodeURIComponent(podNamespace)}/deployments/${encodeURIComponent(deploymentName)}`;
+
+  return new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: 'kubernetes.default.svc',
+      path: apiPath,
+      ca,
+      headers: { Authorization: `Bearer ${token.trim()}` },
+      timeout: 3000
+    }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => {
+        if (response.statusCode !== 200) {
+          reject(new Error(`Kubernetes API returned status ${response.statusCode}.`));
+          return;
+        }
+        try {
+          const deployment = JSON.parse(body);
+          resolve({
+            deployment: deployment.metadata.name,
+            desiredReplicas: deployment.spec.replicas || 0,
+            currentReplicas: deployment.status?.replicas || 0,
+            readyReplicas: deployment.status?.readyReplicas || 0,
+            updatedAt: new Date().toISOString()
+          });
+        } catch {
+          reject(new Error('Kubernetes API returned invalid deployment data.'));
+        }
+      });
+    });
+    request.on('timeout', () => request.destroy(new Error('Kubernetes API request timed out.')));
+    request.on('error', reject);
+  });
 }
 
 /**
@@ -190,22 +254,31 @@ app.get('/api/info', async (req, res) => {
   });
 });
 
+// Current and desired backend replica counts for the HPA dashboard.
+app.get('/api/hpa/status', async (req, res) => {
+  try {
+    res.json(await getDeploymentStatus());
+  } catch (error) {
+    console.warn(`[HPA] Could not read backend replica status (code: ${error.code || 'unavailable'}).`);
+    res.status(503).json({ error: 'Backend replica status is unavailable.' });
+  }
+});
+
 // Database Visits Endpoint - Read History
 app.get('/api/db/visits', async (req, res) => {
-  const pool = await initDbPool();
-  
-  if (!pool) {
-    return res.json({
-      dbStatus: 'Disconnected / Mock Mode',
-      totalVisits: 0,
-      recentVisits: [
-        { id: 1, pod_name: podName, node_az: nodeAZ, visited_at: new Date().toISOString() }
-      ],
-      message: 'PostgreSQL database is currently offline or unreachable from this network.'
-    });
-  }
-
   try {
+    const pool = await initDbPool();
+    if (!pool) {
+      return res.json({
+        dbStatus: 'Disconnected / Mock Mode',
+        totalVisits: 0,
+        recentVisits: [
+          { id: 1, pod_name: podName, node_az: nodeAZ, visited_at: new Date().toISOString() }
+        ],
+        message: 'PostgreSQL connection settings or credentials are unavailable.'
+      });
+    }
+
     const countRes = await pool.query('SELECT COUNT(*) FROM page_visits');
     const recentRes = await pool.query('SELECT * FROM page_visits ORDER BY id DESC LIMIT 10');
 
@@ -215,26 +288,26 @@ app.get('/api/db/visits', async (req, res) => {
       recentVisits: recentRes.rows
     });
   } catch (error) {
+    console.error('[Database] Failed to read page visits.');
     res.status(500).json({
       dbStatus: 'Error',
-      error: error.message
+      error: 'PostgreSQL connection or query failed.'
     });
   }
 });
 
 // Database Visits Endpoint - Log a new visit
 app.post('/api/db/visit', async (req, res) => {
-  const pool = await initDbPool();
-
-  if (!pool) {
-    return res.json({
-      success: false,
-      message: 'Database not connected. Visit recorded in mock mode only.',
-      recorded: { pod_name: podName, node_az: nodeAZ, visited_at: new Date().toISOString() }
-    });
-  }
-
   try {
+    const pool = await initDbPool();
+    if (!pool) {
+      return res.json({
+        success: false,
+        message: 'Database not connected. Visit recorded in mock mode only.',
+        recorded: { pod_name: podName, node_az: nodeAZ, visited_at: new Date().toISOString() }
+      });
+    }
+
     const insertRes = await pool.query(
       'INSERT INTO page_visits (pod_name, node_az) VALUES ($1, $2) RETURNING *',
       [podName, nodeAZ]
@@ -246,7 +319,8 @@ app.post('/api/db/visit', async (req, res) => {
       recorded: insertRes.rows[0]
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[Database] Failed to record page visit.');
+    res.status(500).json({ success: false, error: 'PostgreSQL connection or query failed.' });
   }
 });
 
