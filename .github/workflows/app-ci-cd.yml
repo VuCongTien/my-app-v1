@@ -1,0 +1,163 @@
+name: Build, publish, and propose GitOps update
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/app-ci-cd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/app-ci-cd.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_ACCOUNT_ID: "793239960568"
+  GITOPS_REPOSITORY: VuCongTien/aws-eks-gitops-platform-infra
+
+jobs:
+  validate:
+    name: Build application images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out application source
+        uses: actions/checkout@v7
+
+      - name: Build backend image
+        run: docker build --tag backend:ci ./backend
+
+      - name: Build frontend image
+        run: docker build --tag frontend:ci ./frontend
+
+  publish:
+    name: Push images to ECR
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.image-tag.outputs.value }}
+    steps:
+      - name: Check out application source
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials through GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+          role-session-name: gha-ecr-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set unique image tag
+        id: image-tag
+        run: echo "value=sha-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/backend:${{ steps.image-tag.outputs.value }}
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/frontend:${{ steps.image-tag.outputs.value }}
+
+  propose-gitops-update:
+    name: Open GitOps image update PR
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out GitOps repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.GITOPS_REPOSITORY }}
+          ref: main
+          path: gitops
+          token: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Update Helm image tags
+        working-directory: gitops
+        env:
+          IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          tag = os.environ["IMAGE_TAG"]
+          for filename in ("helm/backend/values.yaml", "helm/frontend/values.yaml"):
+              path = Path(filename)
+              with path.open("r", encoding="utf-8", newline="") as source:
+                  lines = source.readlines()
+              updated = []
+              count = 0
+              for line in lines:
+                  if line.startswith("  tag:"):
+                      ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                      updated.append(f"  tag: {tag}{ending}")
+                      count += 1
+                  else:
+                      updated.append(line)
+              if count != 1:
+                  raise SystemExit(f"Expected one image tag in {filename}; found {count}")
+              with path.open("w", encoding="utf-8", newline="") as destination:
+                  destination.writelines(updated)
+          PY
+
+      - name: Create or update GitOps pull request
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          IMAGE_TAG: ${{ needs.publish.outputs.image_tag }}
+          GITOPS_REPOSITORY: ${{ env.GITOPS_REPOSITORY }}
+        run: |
+          branch="automation/update-image-tags"
+          git switch --create "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add helm/backend/values.yaml helm/frontend/values.yaml
+          if git diff --cached --quiet; then
+            echo "The GitOps repository already references image tag ${IMAGE_TAG}."
+            exit 0
+          fi
+          git commit -m "chore: deploy application images ${IMAGE_TAG}"
+          git push --force origin "$branch"
+
+          if gh pr view --repo "$GITOPS_REPOSITORY" --head "$branch" >/dev/null 2>&1; then
+            echo "Updated existing GitOps pull request."
+          else
+            gh pr create \
+              --repo "$GITOPS_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "Deploy application images ${IMAGE_TAG}" \
+              --body "Updates backend and frontend image tags to commit ${IMAGE_TAG}. Merge to deploy through ArgoCD."
+          fi
