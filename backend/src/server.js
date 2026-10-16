@@ -131,9 +131,8 @@ async function initDbPool() {
 /**
  * Read this deployment's replica status through the in-cluster Kubernetes API.
  */
-async function getDeploymentStatus() {
-  const deploymentName = process.env.DEPLOYMENT_NAME;
-  if (!deploymentName || !podNamespace) {
+async function getDeploymentStatus(namespace, deploymentName) {
+  if (!deploymentName || !namespace) {
     throw new Error('Deployment identity is not configured.');
   }
 
@@ -142,7 +141,7 @@ async function getDeploymentStatus() {
     fs.readFile(path.join(serviceAccountPath, 'token'), 'utf8'),
     fs.readFile(path.join(serviceAccountPath, 'ca.crt'))
   ]);
-  const apiPath = `/apis/apps/v1/namespaces/${encodeURIComponent(podNamespace)}/deployments/${encodeURIComponent(deploymentName)}`;
+  const apiPath = `/apis/apps/v1/namespaces/${encodeURIComponent(namespace)}/deployments/${encodeURIComponent(deploymentName)}`;
 
   return new Promise((resolve, reject) => {
     const request = https.get({
@@ -164,6 +163,7 @@ async function getDeploymentStatus() {
           const deployment = JSON.parse(body);
           resolve({
             deployment: deployment.metadata.name,
+            namespace,
             desiredReplicas: deployment.spec.replicas || 0,
             currentReplicas: deployment.status?.replicas || 0,
             readyReplicas: deployment.status?.readyReplicas || 0,
@@ -257,7 +257,11 @@ app.get('/api/info', async (req, res) => {
 // Current and desired backend replica counts for the HPA dashboard.
 app.get('/api/hpa/status', async (req, res) => {
   try {
-    res.json(await getDeploymentStatus());
+    const [backend, frontend] = await Promise.all([
+      getDeploymentStatus('backend-ns', 'backend-app-backend'),
+      getDeploymentStatus('frontend-ns', 'frontend-app-frontend')
+    ]);
+    res.json({ backend, frontend });
   } catch (error) {
     console.warn(`[HPA] Could not read backend replica status (code: ${error.code || 'unavailable'}).`);
     res.status(503).json({ error: 'Backend replica status is unavailable.' });
@@ -296,7 +300,32 @@ app.get('/api/db/visits', async (req, res) => {
   }
 });
 
-// Database Visits Endpoint - Log a new visit
+// Database Visits Endpoint - Read one visit
+app.get('/api/db/visits/:id', async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Visit id must be a positive integer.' });
+  }
+
+  try {
+    const pool = await initDbPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'Database is not connected.' });
+    }
+
+    const result = await pool.query('SELECT * FROM page_visits WHERE id = $1', [id]);
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Visit not found.' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('[Database] Failed to read page visit.');
+    res.status(500).json({ error: 'PostgreSQL query failed.' });
+  }
+});
+
+// Database Visits Endpoint - Create a new visit
 app.post('/api/db/visit', async (req, res) => {
   try {
     const pool = await initDbPool();
@@ -321,6 +350,68 @@ app.post('/api/db/visit', async (req, res) => {
   } catch (error) {
     console.error('[Database] Failed to record page visit.');
     res.status(500).json({ success: false, error: 'PostgreSQL connection or query failed.' });
+  }
+});
+
+// Database Visits Endpoint - Update a visit
+app.put('/api/db/visits/:id', async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  const { pod_name: podNameValue, node_az: nodeAzValue } = req.body || {};
+
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Visit id must be a positive integer.' });
+  }
+  if (typeof podNameValue !== 'string' || !podNameValue.trim() ||
+      typeof nodeAzValue !== 'string' || !nodeAzValue.trim()) {
+    return res.status(400).json({ error: 'pod_name and node_az are required.' });
+  }
+
+  try {
+    const pool = await initDbPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'Database is not connected.' });
+    }
+
+    const result = await pool.query(
+      'UPDATE page_visits SET pod_name = $1, node_az = $2 WHERE id = $3 RETURNING *',
+      [podNameValue.trim(), nodeAzValue.trim(), id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Visit not found.' });
+    }
+
+    res.json({ success: true, visit: result.rows[0] });
+  } catch (error) {
+    console.error('[Database] Failed to update page visit.');
+    res.status(500).json({ error: 'PostgreSQL query failed.' });
+  }
+});
+
+// Database Visits Endpoint - Delete a visit
+app.delete('/api/db/visits/:id', async (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: 'Visit id must be a positive integer.' });
+  }
+
+  try {
+    const pool = await initDbPool();
+    if (!pool) {
+      return res.status(503).json({ error: 'Database is not connected.' });
+    }
+
+    const result = await pool.query(
+      'DELETE FROM page_visits WHERE id = $1 RETURNING *',
+      [id]
+    );
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Visit not found.' });
+    }
+
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (error) {
+    console.error('[Database] Failed to delete page visit.');
+    res.status(500).json({ error: 'PostgreSQL query failed.' });
   }
 });
 

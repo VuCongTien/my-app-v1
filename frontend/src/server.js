@@ -36,12 +36,9 @@ app.all('/api/proxy/*', async (req, res) => {
       method: req.method,
       headers: {
         'Content-Type': 'application/json',
-        ...req.headers
+        ...(req.headers.authorization ? { authorization: req.headers.authorization } : {})
       }
     };
-    
-    // Remove host header to prevent host mismatch
-    delete fetchOptions.headers.host;
 
     if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
       fetchOptions.body = JSON.stringify(req.body);

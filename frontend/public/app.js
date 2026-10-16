@@ -34,6 +34,9 @@ const hpaCurrentReplicas = document.getElementById('hpaCurrentReplicas');
 const hpaReadyReplicas = document.getElementById('hpaReadyReplicas');
 const hpaDesiredReplicas = document.getElementById('hpaDesiredReplicas');
 const hpaReplicaMessage = document.getElementById('hpaReplicaMessage');
+const frontendCurrentReplicas = document.getElementById('frontendCurrentReplicas');
+const frontendReadyReplicas = document.getElementById('frontendReadyReplicas');
+const frontendDesiredReplicas = document.getElementById('frontendDesiredReplicas');
 
 const dbStatusBadge = document.getElementById('dbStatusBadge');
 const dbHostText = document.getElementById('dbHostText');
@@ -42,6 +45,12 @@ const dbTotalVisits = document.getElementById('dbTotalVisits');
 const logVisitBtn = document.getElementById('logVisitBtn');
 const recentVisitsList = document.getElementById('recentVisitsList');
 const dbActionStatus = document.getElementById('dbActionStatus');
+const visitCrudForm = document.getElementById('visitCrudForm');
+const visitIdInput = document.getElementById('visitIdInput');
+const visitPodInput = document.getElementById('visitPodInput');
+const visitAzInput = document.getElementById('visitAzInput');
+const saveVisitBtn = document.getElementById('saveVisitBtn');
+const cancelEditBtn = document.getElementById('cancelEditBtn');
 
 const secSecretsSource = document.getElementById('secSecretsSource');
 const secAppConfigStatus = document.getElementById('secAppConfigStatus');
@@ -63,6 +72,8 @@ async function initApp() {
   resetStatsBtn.addEventListener('click', resetDistributionStats);
   startStressBtn.addEventListener('click', triggerCpuStress);
   logVisitBtn.addEventListener('click', logDatabaseVisit);
+  visitCrudForm.addEventListener('submit', saveVisit);
+  cancelEditBtn.addEventListener('click', resetVisitForm);
 
   // Initial Fetch & Start Polling
   fetchInfoData();
@@ -279,15 +290,25 @@ async function refreshHpaStatus() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `Backend returned ${res.status}`);
 
-    hpaCurrentReplicas.textContent = data.currentReplicas ?? 0;
-    hpaReadyReplicas.textContent = data.readyReplicas ?? 0;
-    hpaDesiredReplicas.textContent = data.desiredReplicas ?? 0;
-    if (!hpaMonitorRunId) hpaReplicaMessage.textContent = `Deployment: ${data.deployment}`;
-    return data;
+    const backend = data.backend || data;
+    const frontend = data.frontend;
+    hpaCurrentReplicas.textContent = backend.currentReplicas ?? 0;
+    hpaReadyReplicas.textContent = backend.readyReplicas ?? 0;
+    hpaDesiredReplicas.textContent = backend.desiredReplicas ?? 0;
+    frontendCurrentReplicas.textContent = frontend?.currentReplicas ?? '--';
+    frontendReadyReplicas.textContent = frontend?.readyReplicas ?? '--';
+    frontendDesiredReplicas.textContent = frontend?.desiredReplicas ?? '--';
+    if (!hpaMonitorRunId) {
+      hpaReplicaMessage.textContent = `Backend: ${backend.currentReplicas}/${backend.desiredReplicas}; Frontend: ${frontend?.currentReplicas ?? '--'}/${frontend?.desiredReplicas ?? '--'}`;
+    }
+    return backend;
   } catch (err) {
     hpaCurrentReplicas.textContent = '--';
     hpaReadyReplicas.textContent = '--';
     hpaDesiredReplicas.textContent = '--';
+    frontendCurrentReplicas.textContent = '--';
+    frontendReadyReplicas.textContent = '--';
+    frontendDesiredReplicas.textContent = '--';
     hpaReplicaMessage.textContent = 'Replica status unavailable. Check backend service account access and Kubernetes metrics.';
     return null;
   }
@@ -353,12 +374,22 @@ async function fetchDbVisitsData() {
         const timeStr = new Date(v.visited_at).toLocaleTimeString();
         listHtml += `
           <li>
-            <span>Pod: <strong class="font-mono">${v.pod_name}</strong> (${v.node_az})</span>
+            <span> #${v.id} Pod: <strong class="font-mono">${escapeHtml(v.pod_name)}</strong> (${escapeHtml(v.node_az)})</span>
             <span class="font-mono">${timeStr}</span>
+            <span>
+              <button class="btn btn-sm btn-ghost" type="button" data-edit-visit="${v.id}">Edit</button>
+              <button class="btn btn-sm btn-danger" type="button" data-delete-visit="${v.id}">Delete</button>
+            </span>
           </li>
         `;
       });
       recentVisitsList.innerHTML = listHtml;
+      recentVisitsList.querySelectorAll('[data-edit-visit]').forEach(button => {
+        button.addEventListener('click', () => startEditVisit(data.recentVisits.find(v => v.id === Number(button.dataset.editVisit))));
+      });
+      recentVisitsList.querySelectorAll('[data-delete-visit]').forEach(button => {
+        button.addEventListener('click', () => deleteVisit(Number(button.dataset.deleteVisit)));
+      });
     } else {
       recentVisitsList.innerHTML = '<li class="empty-state">No database records found.</li>';
     }
@@ -369,6 +400,78 @@ async function fetchDbVisitsData() {
     dbActionStatus.textContent = 'Could not read PostgreSQL visit records.';
     dbActionStatus.className = 'db-action-status error';
     return null;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[character]));
+}
+
+function startEditVisit(visit) {
+  if (!visit) return;
+  visitIdInput.value = visit.id;
+  visitPodInput.value = visit.pod_name;
+  visitAzInput.value = visit.node_az;
+  saveVisitBtn.textContent = 'Update visit';
+  cancelEditBtn.classList.remove('hidden');
+  visitPodInput.focus();
+}
+
+function resetVisitForm() {
+  visitCrudForm.reset();
+  visitIdInput.value = '';
+  saveVisitBtn.textContent = 'Create visit';
+  cancelEditBtn.classList.add('hidden');
+}
+
+async function saveVisit(event) {
+  event.preventDefault();
+  const id = visitIdInput.value;
+  const payload = {
+    pod_name: visitPodInput.value.trim(),
+    node_az: visitAzInput.value.trim()
+  };
+  saveVisitBtn.disabled = true;
+  dbActionStatus.textContent = id ? 'Updating visit...' : 'Creating visit...';
+  dbActionStatus.className = 'db-action-status';
+
+  try {
+    const res = await fetch(id ? `/api/proxy/db/visits/${id}` : '/api/proxy/db/visit', {
+      method: id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: id ? JSON.stringify(payload) : undefined
+    });
+    const data = await res.json();
+    if (!res.ok || data.success === false) throw new Error(data.error || data.message || `Backend returned ${res.status}`);
+    resetVisitForm();
+    await fetchDbVisitsData();
+    dbActionStatus.textContent = id ? 'Visit updated in PostgreSQL.' : 'Visit created in PostgreSQL.';
+    dbActionStatus.className = 'db-action-status success';
+  } catch (error) {
+    dbActionStatus.textContent = `CRUD operation failed: ${error.message}`;
+    dbActionStatus.className = 'db-action-status error';
+  } finally {
+    saveVisitBtn.disabled = false;
+  }
+}
+
+async function deleteVisit(id) {
+  if (!window.confirm(`Delete visit #${id}?`)) return;
+  dbActionStatus.textContent = `Deleting visit #${id}...`;
+  dbActionStatus.className = 'db-action-status';
+  try {
+    const res = await fetch(`/api/proxy/db/visits/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || `Backend returned ${res.status}`);
+    if (visitIdInput.value === String(id)) resetVisitForm();
+    await fetchDbVisitsData();
+    dbActionStatus.textContent = `Visit #${id} deleted from PostgreSQL.`;
+    dbActionStatus.className = 'db-action-status success';
+  } catch (error) {
+    dbActionStatus.textContent = `Delete failed: ${error.message}`;
+    dbActionStatus.className = 'db-action-status error';
   }
 }
 

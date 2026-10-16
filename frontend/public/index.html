@@ -133,9 +133,12 @@
           <div id="stressStatusText" class="stress-text font-mono">Initializing stress test...</div>
         </div>
         <div class="hpa-replica-summary" aria-live="polite">
-          <div class="replica-metric"><span>Current replicas</span><strong id="hpaCurrentReplicas">--</strong></div>
-          <div class="replica-metric"><span>Ready replicas</span><strong id="hpaReadyReplicas">--</strong></div>
-          <div class="replica-metric"><span>Desired replicas</span><strong id="hpaDesiredReplicas">--</strong></div>
+          <div class="replica-metric"><span>Backend pods</span><strong id="hpaCurrentReplicas">--</strong></div>
+          <div class="replica-metric"><span>Backend ready</span><strong id="hpaReadyReplicas">--</strong></div>
+          <div class="replica-metric"><span>Backend desired</span><strong id="hpaDesiredReplicas">--</strong></div>
+          <div class="replica-metric"><span>Frontend pods</span><strong id="frontendCurrentReplicas">--</strong></div>
+          <div class="replica-metric"><span>Frontend ready</span><strong id="frontendReadyReplicas">--</strong></div>
+          <div class="replica-metric"><span>Frontend desired</span><strong id="frontendDesiredReplicas">--</strong></div>
         </div>
         <p id="hpaReplicaMessage" class="hpa-replica-message" role="status" aria-live="polite">Reading backend replica status...</p>
       </section>
@@ -172,8 +175,22 @@
           <p id="dbActionStatus" class="db-action-status" role="status" aria-live="polite"></p>
         </div>
 
+        <form id="visitCrudForm" class="db-actions">
+          <input id="visitIdInput" type="hidden">
+          <div class="form-group">
+            <label for="visitPodInput">Pod name</label>
+            <input id="visitPodInput" class="text-input" type="text" required placeholder="demo-pod">
+          </div>
+          <div class="form-group">
+            <label for="visitAzInput">Availability zone</label>
+            <input id="visitAzInput" class="text-input" type="text" required placeholder="ap-southeast-1a">
+          </div>
+          <button id="saveVisitBtn" class="btn btn-secondary" type="submit">Create visit</button>
+          <button id="cancelEditBtn" class="btn btn-sm btn-ghost hidden" type="button">Cancel edit</button>
+        </form>
+
         <div class="recent-visits-box">
-          <h4>Recent Database Logs:</h4>
+          <h4>Recent Database Logs (Edit/Delete):</h4>
           <ul id="recentVisitsList" class="visits-list">
             <li class="empty-state">No database records fetched.</li>
           </ul>
